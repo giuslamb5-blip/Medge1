@@ -2,34 +2,32 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional
-from ui.page_optimization import render_optimization_page
+from typing import Dict, List
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
 from core.portfolio_core import (
     cagr_from_returns,
-    vol_ann,
-    sharpe_ratio,
-    sortino_ratio,
-    drawdown_series,
     es_cvar,
     omega_ratio,
-    rachev_ratio,
     optimize_weights,  # legacy: sharpe/sortino/cvar
+    rachev_ratio,
+    sharpe_ratio,
+    sortino_ratio,
+    vol_ann,
 )
 
-# Se esiste, abilita metriche extra + multi-metric
+# Se esiste nel core, abilita metriche extra + multi-metric
 try:
     from core.portfolio_optimization import optimize_weights_multi  # type: ignore
+
     _HAS_OPT_MULTI = True
 except Exception:
     optimize_weights_multi = None
     _HAS_OPT_MULTI = False
-
 
 SS_RUNS = "portfolio_runs"
 SS_ACTIVE = "active_portfolio_pid"
@@ -37,7 +35,7 @@ SS_GLOBAL = "portfolio_global_params"
 
 
 # -------------------------
-# Helpers data
+# Helpers data & portfolio
 # -------------------------
 def _safe_prices(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
@@ -81,7 +79,7 @@ def _ulcer_index(eq: pd.Series) -> float:
     if eq is None or len(eq) < 2:
         return np.nan
     peak = eq.cummax()
-    dd = (eq / peak - 1.0).clip(upper=0.0)  # negativo/0
+    dd = (eq / peak - 1.0).clip(upper=0.0)  # <= 0
     return float(np.sqrt(np.mean(np.square(dd.values))))
 
 
@@ -107,8 +105,8 @@ def _metrics_pack(eq: pd.Series, rp: pd.Series, rf_annual: float, rachev_alpha: 
     out["Max Drawdown"] = float(_max_dd(eq))
     out["Calmar"] = float(_calmar(eq, rp))
     out["Ulcer Index"] = float(_ulcer_index(eq))
-    out["ES/CVaR 95% (daily)"] = float(es_cvar(rp, 0.95))
-    out["ES/CVaR 99% (daily)"] = float(es_cvar(rp, 0.99))
+    out["CVaR 95% (daily)"] = float(es_cvar(rp, 0.95))
+    out["CVaR 99% (daily)"] = float(es_cvar(rp, 0.99))
     out["Omega(τ=0)"] = float(omega_ratio(rp, 0.0))
     out[f"Rachev (α={rachev_alpha:.2f})"] = float(rachev_ratio(rp, rachev_alpha))
     return out
@@ -122,6 +120,7 @@ def _turnover(w0: pd.Series, w1: pd.Series) -> float:
 
 def _apply_holding_constraints(w: pd.Series, max_holdings: int, min_w_threshold: float) -> pd.Series:
     ww = w.copy().astype(float)
+
     if min_w_threshold > 0:
         ww[ww.abs() < float(min_w_threshold)] = 0.0
 
@@ -150,6 +149,7 @@ def _plot_compare_two_base100(eq_a: pd.Series, eq_b: pd.Series, name_a: str, nam
     b = pd.Series(eq_b).dropna()
     if a.empty or b.empty:
         return
+
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot((a / float(a.iloc[0])) * 100.0, label=name_a)
     ax.plot((b / float(b.iloc[0])) * 100.0, label=name_b)
@@ -161,7 +161,7 @@ def _plot_compare_two_base100(eq_a: pd.Series, eq_b: pd.Series, name_a: str, nam
 
 
 def _parse_sector_map(txt: str) -> dict:
-    d = {}
+    d: dict = {}
     if not txt or not txt.strip():
         return d
     for pair in re.split(r"[;,]+", txt.strip()):
@@ -172,7 +172,7 @@ def _parse_sector_map(txt: str) -> dict:
 
 
 def _parse_sector_caps(txt: str) -> dict:
-    d = {}
+    d: dict = {}
     if not txt or not txt.strip():
         return d
     for pair in re.split(r"[;,]+", txt.strip()):
@@ -186,23 +186,20 @@ def _parse_sector_caps(txt: str) -> dict:
 
 
 # =========================================================
-# ✅ ENTRYPOINT richiesto dall'import
+# ✅ ENTRYPOINT richiesto dall'import in page_portfolio.py
 # =========================================================
 def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
-    """
-    UI ottimizzazione modulare. `runs` è il dict dei portafogli calcolati.
-    `pid` è il portfolio attivo. `state` è st.session_state.
-    """
+    st.subheader("Ottimizzazione — What-if + vincoli + confronto immediato")
 
     if not runs:
-        st.info("Run multi prima.")
+        st.info("Definisci portafogli e premi **Run / Update (ALL)**.")
         return
 
     if pid not in runs:
         pid = list(runs.keys())[0]
 
     r = runs.get(pid)
-    if not r or "prices" not in r or r["prices"] is None or r["prices"].empty:
+    if not r or "prices" not in r or r["prices"] is None or getattr(r["prices"], "empty", True):
         st.info("Questo portafoglio non ha prices validi.")
         return
 
@@ -235,6 +232,7 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
 
     cL, cR = st.columns([1.15, 1.0], gap="large")
 
+    # ---------- LEFT: controls ----------
     with cL:
         st.markdown("### 🎯 Setup (what-if)")
 
@@ -258,8 +256,13 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
         else:
             cc1, cc2 = st.columns(2)
             with cc1:
-                p_start = st.date_input("From", value=max(dmin, (pd.to_datetime(dmax) - pd.Timedelta(days=756)).date()),
-                                        min_value=dmin, max_value=dmax, key=f"opt_from__{pid}")
+                p_start = st.date_input(
+                    "From",
+                    value=max(dmin, (pd.to_datetime(dmax) - pd.Timedelta(days=756)).date()),
+                    min_value=dmin,
+                    max_value=dmax,
+                    key=f"opt_from__{pid}",
+                )
             with cc2:
                 p_end = st.date_input("To", value=dmax, min_value=dmin, max_value=dmax, key=f"opt_to__{pid}")
 
@@ -287,10 +290,10 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
         )
 
         if (mode2 == "Multi-metric (composite)") and (not _HAS_OPT_MULTI):
-            st.warning("Per multi-metrica/metriche extra serve `optimize_weights_multi` in core. Ora non è disponibile.")
+            st.warning("Per multi-metrica/metriche extra serve `optimize_weights_multi` in core (non disponibile ora).")
 
-        sel: List[str] = []
-        w_map: Dict[str, float] = {}
+        sel: List[str]
+        w_map: Dict[str, float]
 
         if mode2 == "Multi-metric (composite)":
             sel = st.multiselect(
@@ -299,6 +302,7 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
                 default=["max_sharpe", "min_drawdown"],
                 key=f"opt_multi_metrics__{pid}",
             )
+            w_map = {}
             if sel:
                 st.caption("Pesi relativi (normalizzati automaticamente).")
                 cols_w = st.columns(min(3, len(sel)))
@@ -312,6 +316,8 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
                             step=0.1,
                             key=f"opt_w__{pid}__{m}",
                         )
+            else:
+                w_map = {}
         else:
             obj = st.selectbox("Objective", ALL_METRICS, index=0, key=f"opt_objective__{pid}")
             sel = [obj]
@@ -333,18 +339,17 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
         with c5:
             min_thr = st.number_input("Min weight threshold", min_value=0.0, max_value=0.20, value=0.0, step=0.005, format="%.3f", key=f"opt_min_thr__{pid}")
         with c6:
-            turnover_cap = st.number_input("Turnover cap (0=off)", min_value=0.0, max_value=2.0, value=0.0, step=0.05, format="%.2f", key=f"opt_turnover__{pid}")
+            _turnover_cap = st.number_input("Turnover cap (0=off)", min_value=0.0, max_value=2.0, value=0.0, step=0.05, format="%.2f", key=f"opt_turnover__{pid}")
 
         tcost_bps = st.number_input("Transaction cost (bps)", min_value=0.0, max_value=200.0, value=0.0, step=1.0, key=f"opt_tcost__{pid}")
 
         with st.expander("🏷️ Sector constraints (optional)", expanded=False):
-            sector_map_text = st.text_area("Sector map (Ticker:Sector)", value="", placeholder="AAPL:Tech, MSFT:Tech, XOM:Energy",
-                                           key=f"opt_sector_map__{pid}")
-            sector_caps_text = st.text_area("Sector caps (Sector=cap)", value="", placeholder="Tech=0.6, Energy=0.3",
-                                            key=f"opt_sector_caps__{pid}")
+            sector_map_text = st.text_area("Sector map (Ticker:Sector)", value="", placeholder="AAPL:Tech, MSFT:Tech, XOM:Energy", key=f"opt_sector_map__{pid}")
+            sector_caps_text = st.text_area("Sector caps (Sector=cap)", value="", placeholder="Tech=0.6, Energy=0.3", key=f"opt_sector_caps__{pid}")
 
         do_opt = st.button("🚀 Optimize now", type="primary", use_container_width=True, key=f"btn_optimize__{pid}")
 
+    # ---------- RIGHT: snapshot ----------
     with cR:
         st.markdown("### 📌 Current snapshot")
         st.dataframe(
@@ -355,6 +360,7 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
 
         rets_all = _rets_assets(prices_now)
         rets_win = rets_all.loc[(rets_all.index >= pd.to_datetime(p_start)) & (rets_all.index <= pd.to_datetime(p_end))].copy()
+
         if rets_win.empty:
             st.warning("Finestra returns vuota: allarga la window.")
         else:
@@ -383,12 +389,11 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
                     sector_map = _parse_sector_map(sector_map_text)
                     sector_caps = _parse_sector_caps(sector_caps_text)
 
-                    # Decide solver
-                    need_multi = (mode2 == "Multi-metric (composite)") or (sel and sel[0] not in ["max_sharpe", "max_sortino", "min_cvar95", "min_cvar99"])
+                    need_multi = (mode2 == "Multi-metric (composite)") or (sel and sel[0] not in BASE_METRICS)
 
                     if need_multi:
                         if not _HAS_OPT_MULTI or optimize_weights_multi is None:
-                            raise RuntimeError("Metriche extra / multi-metric richiedono optimize_weights_multi (non disponibile).")
+                            raise RuntimeError("Metriche extra/multi richiedono optimize_weights_multi in core (non presente).")
 
                         w_opt_raw = optimize_weights_multi(
                             rets_assets=rets_win,
@@ -422,11 +427,9 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
                     if s != 0:
                         w_opt = w_opt / s
 
-                    # vincoli extra
                     w_opt = _apply_holding_constraints(w_opt, int(max_holdings), float(min_thr))
                     w_opt = _apply_bounds(w_opt, float(min_w), float(max_w))
 
-                    # turnover + tcost
                     to = _turnover(w_current.reindex(w_opt.index).fillna(0.0), w_opt)
                     cost_pen = to * (float(tcost_bps) / 10000.0)
 
@@ -485,16 +488,15 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Turnover", f reopening the full task completed quickly. Yes. you can apply. f"{to:.2%}" if np.isfinite(to) else "–")
+        st.metric("Turnover", f"{to:.2%}" if np.isfinite(to) else "–")
     with c2:
         st.metric("Cost penalty (approx)", f"{cost_pen*100:.2f}%")
     with c3:
         st.metric("Holdings (opt)", int((w_opt.abs() > 0).sum()))
 
-    dfw = pd.DataFrame({
-        "Current": w_current.reindex(w_opt.index).fillna(0.0),
-        "Optimized": w_opt.reindex(w_opt.index).fillna(0.0),
-    })
+    dfw = pd.DataFrame(
+        {"Current": w_current.reindex(w_opt.index).fillna(0.0), "Optimized": w_opt.reindex(w_opt.index).fillna(0.0)}
+    )
     dfw["Δ"] = dfw["Optimized"] - dfw["Current"]
     dfw["|Δ|"] = dfw["Δ"].abs()
     dfw = dfw.sort_values("|Δ|", ascending=False)
@@ -510,9 +512,9 @@ def render_optimization_page(runs: Dict[str, dict], pid: str, state) -> None:
     _plot_compare_two_base100(eq_cur, eq_opt, "Current", "Optimized")
 
     # turnover cap check
-    turnover_cap = float(state.get(f"opt_turnover__{pid}", 0.0))
-    if turnover_cap > 0 and np.isfinite(to) and to > turnover_cap + 1e-12:
-        st.warning(f"Turnover cap violato: {to:.2%} > {turnover_cap:.2%}.")
+    turnover_cap_val = float(state.get(f"opt_turnover__{pid}", 0.0))
+    if turnover_cap_val > 0 and np.isfinite(to) and to > turnover_cap_val + 1e-12:
+        st.warning(f"Turnover cap violato: {to:.2%} > {turnover_cap_val:.2%}.")
 
     # add to comparison
     cA, cB = st.columns([1.2, 2.0])
